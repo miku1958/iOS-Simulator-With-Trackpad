@@ -11,3 +11,4 @@ active iOS Simulator
 
 enjoy
 
+![AppIcon](https://github.com/miku1958/Large-size-picture-warehouse/blob/master/1.gif?raw=true)
