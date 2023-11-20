@@ -14,6 +14,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		0D4D6FD12B099A71000D7545 /* AppKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppKit.framework; path = System/Library/Frameworks/AppKit.framework; sourceTree = SDKROOT; };
 		FF1E971C23E99FC800C98B3C /* iOS Simulator With Trackpad.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "iOS Simulator With Trackpad.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		FF1E971F23E99FC800C98B3C /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppDelegate.h; sourceTree = "<group>"; };
 		FF1E972023E99FC800C98B3C /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AppDelegate.m; sourceTree = "<group>"; };
@@ -35,13 +36,24 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		0D4D6FD02B099A71000D7545 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				0D4D6FD12B099A71000D7545 /* AppKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		FF1E971323E99FC800C98B3C = {
 			isa = PBXGroup;
 			children = (
 				FF1E971E23E99FC800C98B3C /* iOS Simulator With Trackpad */,
 				FF1E971D23E99FC800C98B3C /* Products */,
+				0D4D6FD02B099A71000D7545 /* Frameworks */,
 			);
+			indentWidth = 4;
 			sourceTree = "<group>";
+			usesTabs = 1;
 		};
 		FF1E971D23E99FC800C98B3C /* Products */ = {
 			isa = PBXGroup;
@@ -269,8 +281,8 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS Simulator With Trackpad/iOS_Simulator_With_Trackpad.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				DEVELOPMENT_TEAM = 3AP6XM8L72;
-				ENABLE_HARDENED_RUNTIME = YES;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = NO;
 				INFOPLIST_FILE = "iOS Simulator With Trackpad/Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -288,8 +300,8 @@
 				CODE_SIGN_ENTITLEMENTS = "iOS Simulator With Trackpad/iOS_Simulator_With_Trackpad.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				DEVELOPMENT_TEAM = 3AP6XM8L72;
-				ENABLE_HARDENED_RUNTIME = YES;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = NO;
 				INFOPLIST_FILE = "iOS Simulator With Trackpad/Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

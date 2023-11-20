@@ -16,6 +16,37 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 #define NSLog(...)
 #endif
 
+typedef NS_ENUM(NSInteger, Position) {
+	PositionTopLeft = 0,
+	PositionBottomLeft = 1,
+};
+
+NSScreen *defaultScreen(void) {
+	for (NSScreen *screen in NSScreen.screens) {
+		if ([screen.deviceDescription[@"NSScreenNumber"] intValue] == 1) {
+			return screen;
+		}
+	}
+	return NSScreen.screens.firstObject;
+}
+
+CGPoint fixedPosition(CGPoint point, Position position) {
+	switch (position) {
+		case PositionTopLeft:
+			return point;
+		case PositionBottomLeft:
+			return CGPointMake(point.x, defaultScreen().frame.size.height - point.y);
+	}
+}
+
+CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
+	switch (position) {
+		case PositionTopLeft:
+			return fixedPosition;
+		case PositionBottomLeft:
+			return CGPointMake(fixedPosition.x, fixedPosition.y - defaultScreen().frame.size.height);
+	}
+}
 
 @interface AppDelegate ()
 @property (nonatomic, assign) BOOL eventTapEnabled;
@@ -23,6 +54,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 @property (nonatomic, assign) CFMachPortRef portRef;
 @property (nonatomic, assign) CFRunLoopSourceRef runLoopSourceRef;
 @property (nonatomic, assign) CGRect topSimulatorWindowBounds;
+@property (nonatomic, assign) AXUIElementRef frontWindow;
+@property (nonatomic, assign) AXObserverRef topSimulatorWindowBoundsUpdateObs;
 @property (nonatomic, assign) CGPoint beginScrollPosition;
 @property (nonatomic, assign) CGPoint currentScrollPosition;
 
@@ -42,6 +75,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
 @interface AppDelegate (Application)
 - (void)updateTargetApplicationBounds;
+- (void)observeTargetApplicationBounds;
 @end
 @implementation AppDelegate
 
@@ -50,7 +84,8 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 //	NSWindowDidResizeNotification
 	[self addStatusBar];
 	_targetBundleIdentifiers = @[
-		@"com.apple.iphonesimulator"
+		@"com.apple.iphonesimulator",
+		@"com.hypergryph.arknights",
 	];
 	
 	dispatch_async(dispatch_get_main_queue(), ^{
@@ -87,7 +122,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 	[_item.menu addItem: showRealMouseCursor];
 }
 - (NSString *)KeyForSelector:(SEL)selector {
-	return [NSString stringWithFormat: @"%@-%@", _targetApplication.bundleIdentifier, NSStringFromSelector(selector)];
+	return [NSString stringWithFormat: @"%@", NSStringFromSelector(selector)];
 }
 - (void)terminate:(id)sender {
     [NSApp terminate:sender];
@@ -106,6 +141,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 }
 - (void)setReplaceScrollAction:(BOOL)replaceScrollAction {
 	[NSUserDefaults.standardUserDefaults setBool: replaceScrollAction forKey: [self KeyForSelector: @selector(replaceScrollAction)]];
+	[NSUserDefaults.standardUserDefaults synchronize];
 }
 
 - (BOOL)showRealMouseCursor {
@@ -113,6 +149,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 }
 - (void)setShowRealMouseCursor:(BOOL)showRealMouseCursor {
 	[NSUserDefaults.standardUserDefaults setBool: showRealMouseCursor forKey: [self KeyForSelector: @selector(showRealMouseCursor)]];
+	[NSUserDefaults.standardUserDefaults synchronize];
 }
 @end
 
@@ -124,8 +161,10 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 - (void)didActivateApplication:(NSRunningApplication *)application {
 	
     _targetApplication = [_targetBundleIdentifiers containsObject: application.bundleIdentifier] ? application : nil;
+
 	if (_targetApplication != nil) {
 		[self updateTargetApplicationBounds];
+		[self observeTargetApplicationBounds];
 	}
 	self.eventTapEnabled = _targetApplication != nil;
 }
@@ -172,6 +211,11 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 @end
 
 @implementation AppDelegate (Application)
+void _updateTargetApplicationBounds(AXObserverRef observer, AXUIElementRef element, CFStringRef notification, void * __nullable refcon) {
+	AppDelegate* delegate = (__bridge AppDelegate *)refcon;
+	[delegate updateTargetApplicationBounds];
+}
+
 - (void)updateTargetApplicationBounds {
 	NSArray *windowInfoList = (__bridge_transfer NSArray *)CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
 	CGRect rect = CGRectZero;
@@ -184,7 +228,43 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 			}
 		}
 	}
+	NSLog(@"topSimulatorWindowBounds: %@", @(rect))
 	_topSimulatorWindowBounds = rect;
+}
+
+- (void)observeTargetApplicationBounds {
+	AXUIElementRef app = AXUIElementCreateApplication(_targetApplication.processIdentifier);
+
+	CFArrayRef names = NULL;
+	AXUIElementCopyAttributeNames(app, &names);
+
+	AXUIElementRef frontWindow = NULL;
+	AXError err = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, (const void **)&frontWindow);
+	if (err != kAXErrorSuccess) {
+		return;
+	}
+
+	if (_frontWindow != nil && CFEqual(_frontWindow, frontWindow)) {
+		return;
+	}
+	_frontWindow = frontWindow;
+
+	if (_topSimulatorWindowBoundsUpdateObs != NULL) {
+		AXObserverRemoveNotification(_topSimulatorWindowBoundsUpdateObs, _frontWindow, kAXMovedNotification);
+		AXObserverRemoveNotification(_topSimulatorWindowBoundsUpdateObs, _frontWindow, kAXResizedNotification);
+		CFRunLoopRemoveSource([[NSRunLoop currentRunLoop] getCFRunLoop], AXObserverGetRunLoopSource(_topSimulatorWindowBoundsUpdateObs), kCFRunLoopDefaultMode);
+	}
+
+	err = AXObserverCreate(_targetApplication.processIdentifier, _updateTargetApplicationBounds, &_topSimulatorWindowBoundsUpdateObs);
+	if (err != kAXErrorSuccess) {
+		return;
+	}
+	AXObserverAddNotification(_topSimulatorWindowBoundsUpdateObs, frontWindow, kAXMovedNotification, (void * _Nullable)self);
+	AXObserverAddNotification(_topSimulatorWindowBoundsUpdateObs, frontWindow, kAXResizedNotification, (void * _Nullable)self);
+
+	CFRunLoopAddSource([[NSRunLoop currentRunLoop] getCFRunLoop],
+					   AXObserverGetRunLoopSource(_topSimulatorWindowBoundsUpdateObs),
+					   kCFRunLoopDefaultMode);
 }
 
 @end
@@ -192,7 +272,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 @implementation AppDelegate (Event)
 
 - (void)sendMouseEvent:(CGEventType)eventType atPosition:(CGPoint)position {
-	CGEventRef eventRef = CGEventCreateMouseEvent(NULL, eventType, position, 0);
+	CGEventRef eventRef = CGEventCreateMouseEvent(NULL, eventType, fixedPositionTo(position, PositionTopLeft), 0);
 	CGEventPost(kCGHIDEventTap, eventRef);
 	if (!self.showRealMouseCursor) {
 		CGWarpMouseCursorPosition(_beginScrollPosition);
@@ -201,17 +281,31 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 @end
 
 static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eventRef, AppDelegate *appDelegate) {
+	// topSimulatorWindowBounds is related to main screen, (0, 0) is left top corner of main, to top is decreasing
+
+	// event.locationInWindow is related to main screen, (0, 0) is left bottom corner of main, to top is increasing
+
+	if (!appDelegate.replaceScrollAction) {
+		return eventRef;
+	}
+	CGRect topSimulatorWindowBounds = appDelegate.topSimulatorWindowBounds;
+	topSimulatorWindowBounds.origin = fixedPosition(topSimulatorWindowBounds.origin, PositionTopLeft);
+
+	NSLog(@"topSimulatorWindowBounds: %@", @(topSimulatorWindowBounds));
+	NSLog(@"CGRectGetMaxX(topSimulatorWindowBounds): %@", @(CGRectGetMaxX(topSimulatorWindowBounds)));
+	NSLog(@"CGRectGetMaxY(topSimulatorWindowBounds): %@", @(CGRectGetMaxY(topSimulatorWindowBounds)));
+
 	__auto_type end = ^CGEventRef() {
-		if (CGPointEqualToPoint(appDelegate.currentScrollPosition, CGPointZero)) {
+		if (appDelegate.currentScrollPosition.x == NSNotFound) {
 			return eventRef;
 		}
 
-		if (appDelegate.topSimulatorWindowBounds.size.width <= 0 || appDelegate.topSimulatorWindowBounds.size.height <= 0) {
+		if (topSimulatorWindowBounds.size.width <= 0 || topSimulatorWindowBounds.size.height <= 0) {
 			return eventRef;
 		}
 		NSLog(@"end");
 		[appDelegate sendMouseEvent: kCGEventLeftMouseUp atPosition: appDelegate.currentScrollPosition];
-		appDelegate.currentScrollPosition = CGPointZero;
+		appDelegate.currentScrollPosition = CGPointMake(NSNotFound, 0);
 		[appDelegate sendMouseEvent: kCGEventMouseMoved atPosition: appDelegate.beginScrollPosition];
 		return eventRef;
 	};
@@ -221,12 +315,14 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 //	NSLog(@"event: %@", event);
 	
 	CGEventType eventType;
-	
+	CGPoint locationInWindow = fixedPosition(event.locationInWindow, PositionBottomLeft);
+	NSLog(@"event.locationInWindow: %@", @(event.locationInWindow));
+	NSLog(@"locationInWindow: %@", @(locationInWindow));
+
 	if (event.phase == NSEventPhaseBegan) {
 		NSLog(@"NSEventMaskBeginGesture");
 		eventType = kCGEventLeftMouseDown;
-		appDelegate.beginScrollPosition =
-		CGPointMake(event.locationInWindow.x, CGRectGetMaxY(NSScreen.mainScreen.frame) - event.locationInWindow.y);
+		appDelegate.beginScrollPosition = locationInWindow;
 		appDelegate.currentScrollPosition = appDelegate.beginScrollPosition;
 	} else if (event.phase == NSEventPhaseEnded) {
 		NSLog(@"NSEventMaskEndGesture");
@@ -235,49 +331,35 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 		NSLog(@"NSEventMaskScrollWheel");
 		eventType = kCGEventLeftMouseDragged;
 	}
-	if (appDelegate.topSimulatorWindowBounds.size.width <= 0 || appDelegate.topSimulatorWindowBounds.size.height <= 0) {
+	if (topSimulatorWindowBounds.size.width <= 0 || topSimulatorWindowBounds.size.height <= 0) {
 		return eventRef;
 	}
 
-	NSLog(@"NSEventMask \n");
 	CGPoint position = appDelegate.currentScrollPosition;
 	position.x += event.scrollingDeltaX;
 	position.y += event.scrollingDeltaY;
 
-	NSLog(@"position.x: %@", @(position));
-	if (position.x > CGRectGetMaxX(appDelegate.topSimulatorWindowBounds)) {
-		NSLog(@"position.x > CGRectGetMaxX(appDelegate.topSimulatorWindowBounds)");
+	NSLog(@"position: %@", @(position));
+	if (position.x > CGRectGetMaxX(topSimulatorWindowBounds)) {
+		NSLog(@"position.x > CGRectGetMaxX(topSimulatorWindowBounds)");
 		return eventRef;
 	}
-	if (position.y > CGRectGetMaxY(appDelegate.topSimulatorWindowBounds)) {
-		NSLog(@"position.y > CGRectGetMaxY(appDelegate.topSimulatorWindowBounds)");
+	if (position.y > CGRectGetMaxY(topSimulatorWindowBounds)) {
+		NSLog(@"position.y > CGRectGetMaxY(topSimulatorWindowBounds)");
 		return eventRef;
 	}
-	if (position.x < appDelegate.topSimulatorWindowBounds.origin.x) {
-		NSLog(@"position.x < appDelegate.topSimulatorWindowBounds.origin.x");
+	if (position.x < topSimulatorWindowBounds.origin.x) {
+		NSLog(@"position.x < topSimulatorWindowBounds.origin.x");
 		return eventRef;
 	}
-	if (position.y < appDelegate.topSimulatorWindowBounds.origin.y) {
-		NSLog(@"position.y < appDelegate.topSimulatorWindowBounds.origin.y");
+	if (position.y < topSimulatorWindowBounds.origin.y) {
+		NSLog(@"position.y < topSimulatorWindowBounds.origin.y");
 		return eventRef;
 	}
-	
+	NSLog(@"----------------------------------------------\n\n");
+
 	appDelegate.currentScrollPosition = position;
-	NSLog(@"Delta event.scrollingDeltaX: %@", @(event.scrollingDeltaX));
-	NSLog(@"Delta event.scrollingDeltaY: %@", @(event.scrollingDeltaY));
-	NSLog(@"Delta event.deltaX: %@", @(event.deltaX));
-	NSLog(@"Delta event.deltaY: %@", @(event.deltaY));
-	NSLog(@"Delta \n");
-	NSLog(@"Location NSScreen.mainScreen.frame: %@", @(NSScreen.mainScreen.frame));
-	NSLog(@"Location event.locationInWindow: %@", @(event.locationInWindow));
-	NSLog(@"Location NSEvent.mouseLocation: %@", @(NSEvent.mouseLocation));
-	NSLog(@"Location appDelegate.topSimulatorWindowBounds: %@", @(appDelegate.topSimulatorWindowBounds));
-	NSLog(@"Location tap position: %@", @(appDelegate.beginScrollPosition));
-	NSLog(@"Location \n");
-	NSLog(@"scrolling position: %@", @(position));
 	[appDelegate sendMouseEvent:eventType atPosition:position];
-	if (appDelegate.replaceScrollAction) {
-		return nil;
-	}
+
 	return eventRef;
 }
