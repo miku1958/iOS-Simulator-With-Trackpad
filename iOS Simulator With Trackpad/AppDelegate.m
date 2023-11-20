@@ -58,6 +58,7 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 @property (nonatomic, assign) AXObserverRef topSimulatorWindowBoundsUpdateObs;
 @property (nonatomic, assign) CGPoint beginScrollPosition;
 @property (nonatomic, assign) CGPoint currentScrollPosition;
+@property (nonatomic, assign) BOOL beginDragAction;
 
 @property (nullable, nonatomic, strong) NSStatusItem *item;
 
@@ -69,6 +70,7 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 @end
 @interface AppDelegate (StatusBar)
 @property (nonatomic, assign) BOOL replaceScrollAction;
+@property (nonatomic, assign) BOOL restrictedToAppWindow;
 @property (nonatomic, assign) BOOL showRealMouseCursor;
 - (void)addStatusBar;
 @end
@@ -104,22 +106,22 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 	_item = [[NSStatusBar systemStatusBar] statusItemWithLength: NSSquareStatusItemLength];
 	[_item.button setTitle: @"S"];
 	_item.menu = [[NSMenu alloc]initWithTitle: @"menu"];
-	
-	
-	NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle: @"quit" action:@selector(terminate:) keyEquivalent: @""];
-	quit.target = self;
-	[_item.menu addItem: quit];
-	
-	
+
 	NSMenuItem *replaceScrollAction = [[NSMenuItem alloc] initWithTitle: self.replaceScrollAction ? @"replaceScrollAction ☑️" : @"replaceScrollAction" action:@selector(switchReplaceScrollAction:) keyEquivalent: @""];
 	replaceScrollAction.target = self;
 	[_item.menu addItem: replaceScrollAction];
 	
-	
+	NSMenuItem *restrictedToAppWindow = [[NSMenuItem alloc] initWithTitle: self.restrictedToAppWindow ? @"restrictedToAppWindow ☑️" : @"restrictedToAppWindow" action:@selector(switchRestrictedToAppWindow:) keyEquivalent: @""];
+	restrictedToAppWindow.target = self;
+	[_item.menu addItem: restrictedToAppWindow];
 	
 	NSMenuItem *showRealMouseCursor = [[NSMenuItem alloc] initWithTitle: self.showRealMouseCursor ? @"showRealMouseCursor ☑️" : @"showRealMouseCursor" action:@selector(switchShowRealMouseCursor:) keyEquivalent: @""];
 	showRealMouseCursor.target = self;
 	[_item.menu addItem: showRealMouseCursor];
+
+	NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle: @"quit" action:@selector(terminate:) keyEquivalent: @""];
+	quit.target = self;
+	[_item.menu addItem: quit];
 }
 - (NSString *)KeyForSelector:(SEL)selector {
 	return [NSString stringWithFormat: @"%@", NSStringFromSelector(selector)];
@@ -132,6 +134,11 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 	item.title = self.replaceScrollAction ? @"replaceScrollAction ☑️" : @"replaceScrollAction";
 }
 
+- (void)switchRestrictedToAppWindow:(NSMenuItem *)item {
+	self.restrictedToAppWindow = !self.restrictedToAppWindow;
+	item.title = self.restrictedToAppWindow ? @"restrictedToAppWindow ☑️" : @"restrictedToAppWindow";
+}
+
 - (void)switchShowRealMouseCursor:(NSMenuItem *)item {
 	self.showRealMouseCursor = !self.showRealMouseCursor;
 	item.title = self.showRealMouseCursor ? @"showRealMouseCursor ☑️" : @"showRealMouseCursor";
@@ -141,6 +148,14 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 }
 - (void)setReplaceScrollAction:(BOOL)replaceScrollAction {
 	[NSUserDefaults.standardUserDefaults setBool: replaceScrollAction forKey: [self KeyForSelector: @selector(replaceScrollAction)]];
+	[NSUserDefaults.standardUserDefaults synchronize];
+}
+
+- (BOOL)restrictedToAppWindow {
+	return [NSUserDefaults.standardUserDefaults boolForKey: [self KeyForSelector: @selector(restrictedToAppWindow)]];
+}
+- (void)setRestrictedToAppWindow:(BOOL)restrictedToAppWindow {
+	[NSUserDefaults.standardUserDefaults setBool: restrictedToAppWindow forKey: [self KeyForSelector: @selector(restrictedToAppWindow)]];
 	[NSUserDefaults.standardUserDefaults synchronize];
 }
 
@@ -324,13 +339,19 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 		eventType = kCGEventLeftMouseDown;
 		appDelegate.beginScrollPosition = locationInWindow;
 		appDelegate.currentScrollPosition = appDelegate.beginScrollPosition;
+		appDelegate.beginDragAction = YES;
 	} else if (event.phase == NSEventPhaseEnded) {
 		NSLog(@"NSEventMaskEndGesture");
+		appDelegate.beginDragAction = NO;
 		return end();
 	} else {
 		NSLog(@"NSEventMaskScrollWheel");
 		eventType = kCGEventLeftMouseDragged;
 	}
+	if (!appDelegate.beginDragAction) {
+		return eventRef;
+	}
+	
 	if (topSimulatorWindowBounds.size.width <= 0 || topSimulatorWindowBounds.size.height <= 0) {
 		return eventRef;
 	}
@@ -338,23 +359,25 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 	CGPoint position = appDelegate.currentScrollPosition;
 	position.x += event.scrollingDeltaX;
 	position.y += event.scrollingDeltaY;
-
 	NSLog(@"position: %@", @(position));
-	if (position.x > CGRectGetMaxX(topSimulatorWindowBounds)) {
-		NSLog(@"position.x > CGRectGetMaxX(topSimulatorWindowBounds)");
-		return eventRef;
-	}
-	if (position.y > CGRectGetMaxY(topSimulatorWindowBounds)) {
-		NSLog(@"position.y > CGRectGetMaxY(topSimulatorWindowBounds)");
-		return eventRef;
-	}
-	if (position.x < topSimulatorWindowBounds.origin.x) {
-		NSLog(@"position.x < topSimulatorWindowBounds.origin.x");
-		return eventRef;
-	}
-	if (position.y < topSimulatorWindowBounds.origin.y) {
-		NSLog(@"position.y < topSimulatorWindowBounds.origin.y");
-		return eventRef;
+
+	if (appDelegate.restrictedToAppWindow) {
+		if (position.x > CGRectGetMaxX(topSimulatorWindowBounds)) {
+			NSLog(@"position.x > CGRectGetMaxX(topSimulatorWindowBounds)");
+			return eventRef;
+		}
+		if (position.y > CGRectGetMaxY(topSimulatorWindowBounds)) {
+			NSLog(@"position.y > CGRectGetMaxY(topSimulatorWindowBounds)");
+			return eventRef;
+		}
+		if (position.x < topSimulatorWindowBounds.origin.x) {
+			NSLog(@"position.x < topSimulatorWindowBounds.origin.x");
+			return eventRef;
+		}
+		if (position.y < topSimulatorWindowBounds.origin.y) {
+			NSLog(@"position.y < topSimulatorWindowBounds.origin.y");
+			return eventRef;
+		}
 	}
 	NSLog(@"----------------------------------------------\n\n");
 
