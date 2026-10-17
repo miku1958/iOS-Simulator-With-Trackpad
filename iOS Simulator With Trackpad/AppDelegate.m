@@ -50,7 +50,7 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 	}
 }
 
-@interface AppDelegate ()
+@interface AppDelegate () <NSMenuDelegate>
 @property (nonatomic, assign) BOOL eventTapEnabled;
 @property (nonatomic, strong) NSRunningApplication *targetApplication;
 @property (nonatomic, assign) CFMachPortRef portRef;
@@ -66,12 +66,14 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 @property (nonatomic, assign) BOOL beginDragAction;
 
 @property (nullable, nonatomic, strong) NSStatusItem *item;
+@property (nonatomic, strong) NSMenuItem *accessibilityStatusMenuItem;
 
 @property (nonatomic, strong) NSArray<NSString *> *targetBundleIdentifiers;
 @end
 
 @interface AppDelegate (Active)
 - (void)workspaceDidActivateApplication:(NSNotification *)notification;
+- (void)didActivateApplication:(NSRunningApplication *)application;
 - (void)installClickActivation;
 - (void)activateApplicationBeforeMouseDown:(CGEventRef)eventRef;
 @end
@@ -79,6 +81,7 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 @property (nonatomic, assign) BOOL replaceScrollAction;
 @property (nonatomic, assign) BOOL restrictedToAppWindow;
 @property (nonatomic, assign) BOOL showRealMouseCursor;
+@property (nonatomic, assign) BOOL automaticallyActivate;
 - (void)addStatusBar;
 @end
 
@@ -101,12 +104,12 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 	[self installClickActivation];
 	
 	dispatch_async(dispatch_get_main_queue(), ^{
-		[NSApplication.sharedApplication.keyWindow orderOut:self];
 		for (NSRunningApplication *app in NSWorkspace.sharedWorkspace.runningApplications) {
 			if ([self.targetBundleIdentifiers containsObject: app.bundleIdentifier]) {
 				[NSWorkspace.sharedWorkspace launchAppWithBundleIdentifier: app.bundleIdentifier options:NSWorkspaceLaunchDefault additionalEventParamDescriptor: nil launchIdentifier: nil];
 			}
 		}
+		[self didActivateApplication:NSWorkspace.sharedWorkspace.frontmostApplication];
 	});
 }
 
@@ -127,26 +130,76 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 @end
 
 @implementation AppDelegate (StatusBar)
+- (void)addTrackpadMenuItemWithTitle:(NSString *)title action:(SEL)action symbol:(NSString *)symbol {
+	NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:@""];
+	item.target = self;
+	if (@available(macOS 11.0, *)) {
+		item.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
+		item.image.template = YES;
+		item.image.size = NSMakeSize(16, 16);
+	}
+	[_item.menu addItem:item];
+}
+
+- (void)addTrackpadMenuSection:(NSString *)title {
+	NSMenuItem *section;
+	if (@available(macOS 14.0, *)) {
+		section = [NSMenuItem sectionHeaderWithTitle:title];
+	} else {
+		section = [[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""];
+		section.enabled = NO;
+	}
+	[_item.menu addItem:section];
+}
+
 - (void)addStatusBar {
 	_item = [[NSStatusBar systemStatusBar] statusItemWithLength: NSSquareStatusItemLength];
-	[_item.button setTitle: @"S"];
-	_item.menu = [[NSMenu alloc]initWithTitle: @"menu"];
+	_item.button.toolTip = @"Trackpad";
+	_item.button.accessibilityLabel = @"Trackpad";
+	if (@available(macOS 11.0, *)) {
+		_item.button.image = [NSImage imageWithSystemSymbolName:@"rectangle.and.hand.point.up.left" accessibilityDescription:@"Trackpad"];
+		_item.button.image.template = YES;
+		_item.button.image.size = NSMakeSize(18, 18);
+	} else {
+		_item.button.title = @"TP";
+	}
+	_item.menu = [[NSMenu alloc] initWithTitle:@"Trackpad"];
+	_item.menu.minimumWidth = 250;
+	_item.menu.autoenablesItems = NO;
+	_item.menu.delegate = self;
 
-	NSMenuItem *replaceScrollAction = [[NSMenuItem alloc] initWithTitle: self.replaceScrollAction ? @"replaceScrollAction ☑️" : @"replaceScrollAction" action:@selector(switchReplaceScrollAction:) keyEquivalent: @""];
-	replaceScrollAction.target = self;
-	[_item.menu addItem: replaceScrollAction];
-	
-	NSMenuItem *restrictedToAppWindow = [[NSMenuItem alloc] initWithTitle: self.restrictedToAppWindow ? @"restrictedToAppWindow ☑️" : @"restrictedToAppWindow" action:@selector(switchRestrictedToAppWindow:) keyEquivalent: @""];
-	restrictedToAppWindow.target = self;
-	[_item.menu addItem: restrictedToAppWindow];
-	
-	NSMenuItem *showRealMouseCursor = [[NSMenuItem alloc] initWithTitle: self.showRealMouseCursor ? @"showRealMouseCursor ☑️" : @"showRealMouseCursor" action:@selector(switchShowRealMouseCursor:) keyEquivalent: @""];
-	showRealMouseCursor.target = self;
-	[_item.menu addItem: showRealMouseCursor];
+	[self addTrackpadMenuSection:@"Trackpad"];
+	[self addTrackpadMenuItemWithTitle:@"双指滚动模拟拖拽" action:@selector(switchReplaceScrollAction:) symbol:@"hand.draw"];
+	[self addTrackpadMenuItemWithTitle:@"限制在目标窗口内" action:@selector(switchRestrictedToAppWindow:) symbol:@"rectangle.dashed"];
+	[self addTrackpadMenuItemWithTitle:@"显示真实鼠标指针" action:@selector(switchShowRealMouseCursor:) symbol:@"cursorarrow"];
+	[_item.menu addItem:NSMenuItem.separatorItem];
+	[self addTrackpadMenuSection:@"窗口"];
+	[self addTrackpadMenuItemWithTitle:@"点击时自动激活" action:@selector(switchAutomaticallyActivate:) symbol:@"cursorarrow.click"];
+	[_item.menu addItem:NSMenuItem.separatorItem];
+	_accessibilityStatusMenuItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+	_accessibilityStatusMenuItem.enabled = NO;
+	[_item.menu addItem:_accessibilityStatusMenuItem];
+	[_item.menu addItem:NSMenuItem.separatorItem];
+	[self addTrackpadMenuItemWithTitle:@"退出 Trackpad" action:@selector(terminate:) symbol:@"power"];
+	_item.menu.itemArray.lastObject.keyEquivalent = @"q";
+	[self menuWillOpen:_item.menu];
+}
 
-	NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle: @"quit" action:@selector(terminate:) keyEquivalent: @""];
-	quit.target = self;
-	[_item.menu addItem: quit];
+- (void)menuWillOpen:(NSMenu *)menu {
+	for (NSMenuItem *item in menu.itemArray) {
+		if (item.action == @selector(switchReplaceScrollAction:)) {
+			item.state = self.replaceScrollAction ? NSControlStateValueOn : NSControlStateValueOff;
+		} else if (item.action == @selector(switchRestrictedToAppWindow:)) {
+			item.state = self.restrictedToAppWindow ? NSControlStateValueOn : NSControlStateValueOff;
+			item.enabled = self.replaceScrollAction;
+		} else if (item.action == @selector(switchShowRealMouseCursor:)) {
+			item.state = self.showRealMouseCursor ? NSControlStateValueOn : NSControlStateValueOff;
+			item.enabled = self.replaceScrollAction;
+		} else if (item.action == @selector(switchAutomaticallyActivate:)) {
+			item.state = self.automaticallyActivate ? NSControlStateValueOn : NSControlStateValueOff;
+		}
+	}
+	_accessibilityStatusMenuItem.title = AXIsProcessTrusted() ? @"辅助功能已授权" : @"辅助功能未授权";
 }
 - (NSString *)KeyForSelector:(SEL)selector {
 	return [NSString stringWithFormat: @"%@", NSStringFromSelector(selector)];
@@ -156,17 +209,22 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 }
 - (void)switchReplaceScrollAction:(NSMenuItem *)item {
 	self.replaceScrollAction = !self.replaceScrollAction;
-	item.title = self.replaceScrollAction ? @"replaceScrollAction ☑️" : @"replaceScrollAction";
+	[self menuWillOpen:_item.menu];
 }
 
 - (void)switchRestrictedToAppWindow:(NSMenuItem *)item {
 	self.restrictedToAppWindow = !self.restrictedToAppWindow;
-	item.title = self.restrictedToAppWindow ? @"restrictedToAppWindow ☑️" : @"restrictedToAppWindow";
+	[self menuWillOpen:_item.menu];
 }
 
 - (void)switchShowRealMouseCursor:(NSMenuItem *)item {
 	self.showRealMouseCursor = !self.showRealMouseCursor;
-	item.title = self.showRealMouseCursor ? @"showRealMouseCursor ☑️" : @"showRealMouseCursor";
+	[self menuWillOpen:_item.menu];
+}
+
+- (void)switchAutomaticallyActivate:(NSMenuItem *)item {
+	self.automaticallyActivate = !self.automaticallyActivate;
+	[self menuWillOpen:_item.menu];
 }
 - (BOOL)replaceScrollAction {
 	return [NSUserDefaults.standardUserDefaults boolForKey: [self KeyForSelector: @selector(replaceScrollAction)]];
@@ -191,6 +249,25 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 	[NSUserDefaults.standardUserDefaults setBool: showRealMouseCursor forKey: [self KeyForSelector: @selector(showRealMouseCursor)]];
 	[NSUserDefaults.standardUserDefaults synchronize];
 }
+
+- (BOOL)automaticallyActivate {
+	NSString *key = [self KeyForSelector:@selector(automaticallyActivate)];
+	return [NSUserDefaults.standardUserDefaults objectForKey:key] == nil || [NSUserDefaults.standardUserDefaults boolForKey:key];
+}
+
+- (void)setAutomaticallyActivate:(BOOL)automaticallyActivate {
+	[NSUserDefaults.standardUserDefaults setBool:automaticallyActivate forKey:[self KeyForSelector:@selector(automaticallyActivate)]];
+	if (automaticallyActivate) {
+		[self installClickActivation];
+	} else {
+		[_clickActivationRetryTimer invalidate];
+		_clickActivationRetryTimer = nil;
+	}
+	if (_clickActivationPort != NULL) {
+		CGEventTapEnable(_clickActivationPort, automaticallyActivate);
+	}
+	os_log(OS_LOG_DEFAULT, "%.0f automatic activation setting enabled=%d", NSDate.date.timeIntervalSince1970 * 1000, automaticallyActivate);
+}
 @end
 
 @implementation AppDelegate (Active)
@@ -213,7 +290,7 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 }
 
 - (void)installClickActivation {
-	if (_clickActivationPort != NULL) {
+	if (!self.automaticallyActivate || _clickActivationPort != NULL) {
 		return;
 	}
 	if (_clickActivationRetryTimer == nil) {
@@ -475,10 +552,10 @@ static CGEventRef clickActivationCallback(CGEventTapProxy proxy, CGEventType typ
 	AppDelegate *appDelegate = (__bridge AppDelegate *)context;
 	if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
 		os_log_error(OS_LOG_DEFAULT, "%.0f click tap disabled reason=%u; enabling", NSDate.date.timeIntervalSince1970 * 1000, type);
-		CGEventTapEnable(appDelegate.clickActivationPort, true);
+		CGEventTapEnable(appDelegate.clickActivationPort, appDelegate.automaticallyActivate);
 		return eventRef;
 	}
-	if ((type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown || type == kCGEventOtherMouseDown) &&
+	if (appDelegate.automaticallyActivate && (type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown || type == kCGEventOtherMouseDown) &&
 		(CGEventGetFlags(eventRef) & kCGEventFlagMaskCommand) == 0 &&
 		CGEventGetIntegerValueField(eventRef, kCGEventSourceUnixProcessID) != NSProcessInfo.processInfo.processIdentifier) {
 		[appDelegate activateApplicationBeforeMouseDown:eventRef];
