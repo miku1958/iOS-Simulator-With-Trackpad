@@ -87,6 +87,7 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 	[self addStatusBar];
 	_targetBundleIdentifiers = @[
 		@"com.apple.iphonesimulator",
+		@"com.apple.ScreenContinuity",
 		@"com.hypergryph.arknights",
 	];
 	
