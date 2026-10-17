@@ -64,6 +64,8 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 @property (nonatomic, assign) CGPoint beginScrollPosition;
 @property (nonatomic, assign) CGPoint currentScrollPosition;
 @property (nonatomic, assign) BOOL beginDragAction;
+@property (nonatomic, assign) BOOL scrollActivationFailed;
+@property (nonatomic, assign) BOOL scrollWindowBoundsLocked;
 
 @property (nullable, nonatomic, strong) NSStatusItem *item;
 @property (nonatomic, strong) NSMenuItem *accessibilityStatusMenuItem;
@@ -174,7 +176,7 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 	[self addTrackpadMenuItemWithTitle:@"显示真实鼠标指针" action:@selector(switchShowRealMouseCursor:) symbol:@"cursorarrow"];
 	[_item.menu addItem:NSMenuItem.separatorItem];
 	[self addTrackpadMenuSection:@"窗口"];
-	[self addTrackpadMenuItemWithTitle:@"点击时自动激活" action:@selector(switchAutomaticallyActivate:) symbol:@"cursorarrow.click"];
+	[self addTrackpadMenuItemWithTitle:@"自动激活目标窗口" action:@selector(switchAutomaticallyActivate:) symbol:@"cursorarrow.click"];
 	[_item.menu addItem:NSMenuItem.separatorItem];
 	_accessibilityStatusMenuItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
 	_accessibilityStatusMenuItem.enabled = NO;
@@ -257,11 +259,14 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 
 - (void)setAutomaticallyActivate:(BOOL)automaticallyActivate {
 	[NSUserDefaults.standardUserDefaults setBool:automaticallyActivate forKey:[self KeyForSelector:@selector(automaticallyActivate)]];
+	self.scrollActivationFailed = NO;
+	self.scrollWindowBoundsLocked = NO;
 	if (automaticallyActivate) {
 		[self installClickActivation];
 	} else {
 		[_clickActivationRetryTimer invalidate];
 		_clickActivationRetryTimer = nil;
+		[self updateTargetApplicationBounds];
 	}
 	if (_clickActivationPort != NULL) {
 		CGEventTapEnable(_clickActivationPort, automaticallyActivate);
@@ -311,7 +316,7 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 	if (!AXIsProcessTrusted()) {
 		return;
 	}
-	CGEventMask mask = CGEventMaskBit(kCGEventLeftMouseDown) | CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventOtherMouseDown);
+	CGEventMask mask = CGEventMaskBit(kCGEventLeftMouseDown) | CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventOtherMouseDown) | CGEventMaskBit(kCGEventScrollWheel);
 	_clickActivationPort = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, mask, clickActivationCallback, (__bridge void *)self);
 	os_log(OS_LOG_DEFAULT, "%.0f click tap created=%d trusted=%d", NSDate.date.timeIntervalSince1970 * 1000, _clickActivationPort != NULL, AXIsProcessTrusted());
 	if (_clickActivationPort == NULL) {
@@ -388,6 +393,9 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 		CFRelease(element);
 		return;
 	}
+	if (CGEventGetType(eventRef) == kCGEventScrollWheel) {
+		self.scrollActivationFailed = YES;
+	}
 	AXUIElementRef target = AXUIElementCreateApplication(processIdentifier);
 	os_log(OS_LOG_DEFAULT, "%.0f target click pid=%d source=%lld event_target=%lld window=%lld x=%.1f y=%.1f", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, CGEventGetIntegerValueField(eventRef, kCGEventSourceUnixProcessID), CGEventGetIntegerValueField(eventRef, kCGEventTargetUnixProcessID), CGEventGetIntegerValueField(eventRef, kCGMouseEventWindowUnderMousePointer), location.x, location.y);
 	CFTypeRef role = NULL;
@@ -420,13 +428,43 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 	if (focusedWindow != NULL) {
 		CFRelease(focusedWindow);
 	}
+	BOOL activationSucceeded = application.active;
 	if (!application.active && prepareElement(target)) {
 		error = AXUIElementSetAttributeValue(target, kAXFrontmostAttribute, kCFBooleanTrue);
+		activationSucceeded = error == kAXErrorSuccess;
 		os_log(OS_LOG_DEFAULT, "%.0f click activation pid=%d error=%d", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, error);
 	}
+	BOOL windowIsReady = windowIsFocused;
 	if ((!application.active || !windowIsFocused) && prepareElement(window)) {
 		error = AXUIElementPerformAction(window, kAXRaiseAction);
+		windowIsReady = windowIsFocused || error == kAXErrorSuccess;
 		os_log(OS_LOG_DEFAULT, "%.0f clicked window raise pid=%d error=%d", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, error);
+	}
+	if (CGEventGetType(eventRef) == kCGEventScrollWheel && activationSucceeded && windowIsReady) {
+		CFTypeRef positionValue = NULL;
+		CFTypeRef sizeValue = NULL;
+		AXError boundsError = prepareElement(window) ? AXUIElementCopyAttributeValue(window, kAXPositionAttribute, &positionValue) : kAXErrorCannotComplete;
+		if (boundsError == kAXErrorSuccess) {
+			boundsError = prepareElement(window) ? AXUIElementCopyAttributeValue(window, kAXSizeAttribute, &sizeValue) : kAXErrorCannotComplete;
+		}
+		CGPoint position;
+		CGSize size;
+		if (boundsError == kAXErrorSuccess && AXValueGetValue(positionValue, kAXValueCGPointType, &position) && AXValueGetValue(sizeValue, kAXValueCGSizeType, &size)) {
+			self.targetApplication = application;
+			self.scrollWindowBoundsLocked = YES;
+			self.topSimulatorWindowBounds = (CGRect){position, size};
+			self.scrollActivationFailed = NO;
+			self.eventTapEnabled = YES;
+			os_log(OS_LOG_DEFAULT, "%.0f scroll activation ready pid=%d tap=%d", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, self.eventTapEnabled);
+		} else {
+			os_log_error(OS_LOG_DEFAULT, "%.0f scroll activation bounds unavailable pid=%d error=%d; passing original scroll", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, boundsError);
+		}
+		if (positionValue != NULL) {
+			CFRelease(positionValue);
+		}
+		if (sizeValue != NULL) {
+			CFRelease(sizeValue);
+		}
 	}
 	os_log(OS_LOG_DEFAULT, "%.0f click finish pid=%d active=%d duration_ms=%.1f", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, application.active, (CFAbsoluteTimeGetCurrent() - started) * 1000);
 	CFRelease(target);
@@ -482,6 +520,9 @@ void _updateTargetApplicationBounds(AXObserverRef observer, AXUIElementRef eleme
 }
 
 - (void)updateTargetApplicationBounds {
+	if (_scrollWindowBoundsLocked) {
+		return;
+	}
 	NSArray *windowInfoList = (__bridge_transfer NSArray *)CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
 	CGRect rect = CGRectZero;
 	for(NSDictionary *windowInfo in windowInfoList) {
@@ -555,9 +596,21 @@ static CGEventRef clickActivationCallback(CGEventTapProxy proxy, CGEventType typ
 		CGEventTapEnable(appDelegate.clickActivationPort, appDelegate.automaticallyActivate);
 		return eventRef;
 	}
-	if (appDelegate.automaticallyActivate && (type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown || type == kCGEventOtherMouseDown) &&
+	BOOL beginsScroll = type == kCGEventScrollWheel &&
+		CGEventGetIntegerValueField(eventRef, kCGScrollWheelEventIsContinuous) != 0 &&
+		(CGEventGetIntegerValueField(eventRef, kCGScrollWheelEventScrollPhase) & kCGScrollPhaseBegan) != 0;
+	if (beginsScroll) {
+		appDelegate.scrollActivationFailed = NO;
+		appDelegate.scrollWindowBoundsLocked = NO;
+	} else if (type == kCGEventScrollWheel && (CGEventGetIntegerValueField(eventRef, kCGScrollWheelEventScrollPhase) & (kCGScrollPhaseEnded | kCGScrollPhaseCancelled)) != 0) {
+		appDelegate.scrollWindowBoundsLocked = NO;
+	}
+	if (appDelegate.automaticallyActivate && (beginsScroll || type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown || type == kCGEventOtherMouseDown) &&
 		(CGEventGetFlags(eventRef) & kCGEventFlagMaskCommand) == 0 &&
 		CGEventGetIntegerValueField(eventRef, kCGEventSourceUnixProcessID) != NSProcessInfo.processInfo.processIdentifier) {
+		if (beginsScroll) {
+			os_log(OS_LOG_DEFAULT, "%.0f scroll activation begin", NSDate.date.timeIntervalSince1970 * 1000);
+		}
 		[appDelegate activateApplicationBeforeMouseDown:eventRef];
 	}
 	return eventRef;
@@ -571,7 +624,7 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
 	// event.locationInWindow is related to main screen, (0, 0) is left bottom corner of main, to top is increasing
 
-	if (!appDelegate.replaceScrollAction) {
+	if (!appDelegate.replaceScrollAction || appDelegate.scrollActivationFailed) {
 		return eventRef;
 	}
 	CGRect topSimulatorWindowBounds = appDelegate.topSimulatorWindowBounds;
