@@ -7,8 +7,10 @@
 //
 
 #import "AppDelegate.h"
+#import <os/log.h>
 
 static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eventRef, AppDelegate *appDelegate);
+static CGEventRef clickActivationCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eventRef, void *context);
 
 #ifdef DEBUG
 #define NSLog(...) printf("%s", [NSString stringWithFormat:__VA_ARGS__].UTF8String);printf("\n");
@@ -53,6 +55,9 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 @property (nonatomic, strong) NSRunningApplication *targetApplication;
 @property (nonatomic, assign) CFMachPortRef portRef;
 @property (nonatomic, assign) CFRunLoopSourceRef runLoopSourceRef;
+@property (nonatomic, assign) CFMachPortRef clickActivationPort;
+@property (nonatomic, assign) CFRunLoopSourceRef clickActivationSource;
+@property (nonatomic, strong) NSTimer *clickActivationRetryTimer;
 @property (nonatomic, assign) CGRect topSimulatorWindowBounds;
 @property (nonatomic, assign) AXUIElementRef frontWindow;
 @property (nonatomic, assign) AXObserverRef topSimulatorWindowBoundsUpdateObs;
@@ -67,6 +72,8 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 
 @interface AppDelegate (Active)
 - (void)workspaceDidActivateApplication:(NSNotification *)notification;
+- (void)installClickActivation;
+- (void)activateApplicationBeforeMouseDown:(CGEventRef)eventRef;
 @end
 @interface AppDelegate (StatusBar)
 @property (nonatomic, assign) BOOL replaceScrollAction;
@@ -82,6 +89,7 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
+	os_log(OS_LOG_DEFAULT, "%.0f trackpad launch pid=%d trusted=%d replace=%d restricted=%d", NSDate.date.timeIntervalSince1970 * 1000, NSProcessInfo.processInfo.processIdentifier, AXIsProcessTrusted(), self.replaceScrollAction, self.restrictedToAppWindow);
 	[NSWorkspace.sharedWorkspace.notificationCenter addObserver: self selector: @selector(workspaceDidActivateApplication:) name: NSWorkspaceDidActivateApplicationNotification object: nil];
 //	NSWindowDidResizeNotification
 	[self addStatusBar];
@@ -90,6 +98,7 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 		@"com.apple.ScreenContinuity",
 		@"com.hypergryph.arknights",
 	];
+	[self installClickActivation];
 	
 	dispatch_async(dispatch_get_main_queue(), ^{
 		[NSApplication.sharedApplication.keyWindow orderOut:self];
@@ -99,6 +108,21 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 			}
 		}
 	});
+}
+
+- (void)applicationWillTerminate:(NSNotification *)notification {
+	[_clickActivationRetryTimer invalidate];
+	_clickActivationRetryTimer = nil;
+	if (_clickActivationSource != NULL) {
+		CFRunLoopRemoveSource(CFRunLoopGetMain(), _clickActivationSource, kCFRunLoopCommonModes);
+		CFRelease(_clickActivationSource);
+		_clickActivationSource = NULL;
+	}
+	if (_clickActivationPort != NULL) {
+		CFMachPortInvalidate(_clickActivationPort);
+		CFRelease(_clickActivationPort);
+		_clickActivationPort = NULL;
+	}
 }
 @end
 
@@ -175,14 +199,161 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
     [self didActivateApplication:[[notification userInfo] objectForKey:NSWorkspaceApplicationKey]];
 }
 - (void)didActivateApplication:(NSRunningApplication *)application {
-	
+	if (_clickActivationPort == NULL && AXIsProcessTrusted()) {
+		[self installClickActivation];
+	}
     _targetApplication = [_targetBundleIdentifiers containsObject: application.bundleIdentifier] ? application : nil;
+	os_log(OS_LOG_DEFAULT, "%.0f activation notification pid=%d target=%d", NSDate.date.timeIntervalSince1970 * 1000, application.processIdentifier, _targetApplication.processIdentifier);
 
 	if (_targetApplication != nil) {
 		[self updateTargetApplicationBounds];
 		[self observeTargetApplicationBounds];
 	}
 	self.eventTapEnabled = _targetApplication != nil;
+}
+
+- (void)installClickActivation {
+	if (_clickActivationPort != NULL) {
+		return;
+	}
+	if (_clickActivationRetryTimer == nil) {
+		__weak typeof(self) weakself = self;
+		_clickActivationRetryTimer = [NSTimer timerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *timer) {
+			__strong typeof(self) self = weakself;
+			if (self == nil) {
+				[timer invalidate];
+				return;
+			}
+			if (AXIsProcessTrusted()) {
+				[self installClickActivation];
+			}
+		}];
+		[NSRunLoop.mainRunLoop addTimer:_clickActivationRetryTimer forMode:NSRunLoopCommonModes];
+		os_log(OS_LOG_DEFAULT, "%.0f click listener installation started", NSDate.date.timeIntervalSince1970 * 1000);
+	}
+	if (!AXIsProcessTrusted()) {
+		return;
+	}
+	CGEventMask mask = CGEventMaskBit(kCGEventLeftMouseDown) | CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventOtherMouseDown);
+	_clickActivationPort = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, mask, clickActivationCallback, (__bridge void *)self);
+	os_log(OS_LOG_DEFAULT, "%.0f click tap created=%d trusted=%d", NSDate.date.timeIntervalSince1970 * 1000, _clickActivationPort != NULL, AXIsProcessTrusted());
+	if (_clickActivationPort == NULL) {
+		NSLog(@"%.0f click activation tap creation failed; scrolling is unchanged", NSDate.date.timeIntervalSince1970 * 1000);
+		return;
+	}
+	_clickActivationSource = CFMachPortCreateRunLoopSource(NULL, _clickActivationPort, 0);
+	if (_clickActivationSource == NULL) {
+		CFMachPortInvalidate(_clickActivationPort);
+		CFRelease(_clickActivationPort);
+		_clickActivationPort = NULL;
+		NSLog(@"%.0f click activation source creation failed; scrolling is unchanged", NSDate.date.timeIntervalSince1970 * 1000);
+		return;
+	}
+	CFRunLoopAddSource(CFRunLoopGetMain(), _clickActivationSource, kCFRunLoopCommonModes);
+	[_clickActivationRetryTimer invalidate];
+	_clickActivationRetryTimer = nil;
+	os_log(OS_LOG_DEFAULT, "%.0f click listener installation finished", NSDate.date.timeIntervalSince1970 * 1000);
+}
+
+- (void)activateApplicationBeforeMouseDown:(CGEventRef)eventRef {
+	CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
+	CGPoint location = CGEventGetLocation(eventRef);
+	NSArray *windows = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+	pid_t processIdentifier = 0;
+	for (NSDictionary *information in windows) {
+		CGRect bounds = CGRectZero;
+		if ([information[(id)kCGWindowAlpha] doubleValue] > 0 &&
+			CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)information[(id)kCGWindowBounds], &bounds) && CGRectContainsPoint(bounds, location)) {
+			NSRunningApplication *candidate = [NSRunningApplication runningApplicationWithProcessIdentifier:[information[(id)kCGWindowOwnerPID] intValue]];
+			if (candidate.bundleIdentifier != nil && [self.targetBundleIdentifiers containsObject:candidate.bundleIdentifier]) {
+				processIdentifier = candidate.processIdentifier;
+				break;
+			}
+		}
+	}
+	NSRunningApplication *application = [NSRunningApplication runningApplicationWithProcessIdentifier:processIdentifier];
+	if (application.bundleIdentifier == nil || ![self.targetBundleIdentifiers containsObject:application.bundleIdentifier]) {
+		return;
+	}
+	CFAbsoluteTime deadline = started + 0.15;
+	BOOL (^prepareElement)(AXUIElementRef) = ^BOOL(AXUIElementRef element) {
+		CFTimeInterval remaining = deadline - CFAbsoluteTimeGetCurrent();
+		if (remaining <= 0) {
+			os_log_error(OS_LOG_DEFAULT, "%.0f click activation budget expired pid=%d; passing original click", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier);
+			return NO;
+		}
+		AXError error = AXUIElementSetMessagingTimeout(element, (float)remaining);
+		if (error != kAXErrorSuccess) {
+			os_log_error(OS_LOG_DEFAULT, "%.0f click AX timeout setup failed pid=%d error=%d", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, error);
+		}
+		return error == kAXErrorSuccess;
+	};
+	AXUIElementRef system = AXUIElementCreateSystemWide();
+	AXUIElementRef element = NULL;
+	AXError error = prepareElement(system) ? AXUIElementCopyElementAtPosition(system, location.x, location.y, &element) : kAXErrorCannotComplete;
+	AXError resetError = AXUIElementSetMessagingTimeout(system, 0);
+	if (resetError != kAXErrorSuccess) {
+		os_log_error(OS_LOG_DEFAULT, "%.0f click AX default timeout restore failed error=%d", NSDate.date.timeIntervalSince1970 * 1000, resetError);
+	}
+	CFRelease(system);
+	if (error != kAXErrorSuccess) {
+		os_log_error(OS_LOG_DEFAULT, "%.0f click hit test failed error=%d duration_ms=%.1f", NSDate.date.timeIntervalSince1970 * 1000, error, (CFAbsoluteTimeGetCurrent() - started) * 1000);
+		return;
+	}
+	error = AXUIElementGetPid(element, &processIdentifier);
+	if (error != kAXErrorSuccess) {
+		os_log_error(OS_LOG_DEFAULT, "%.0f click owner lookup failed error=%d", NSDate.date.timeIntervalSince1970 * 1000, error);
+		CFRelease(element);
+		return;
+	}
+	application = [NSRunningApplication runningApplicationWithProcessIdentifier:processIdentifier];
+	if (application.bundleIdentifier == nil || ![self.targetBundleIdentifiers containsObject:application.bundleIdentifier]) {
+		CFRelease(element);
+		return;
+	}
+	AXUIElementRef target = AXUIElementCreateApplication(processIdentifier);
+	os_log(OS_LOG_DEFAULT, "%.0f target click pid=%d source=%lld event_target=%lld window=%lld x=%.1f y=%.1f", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, CGEventGetIntegerValueField(eventRef, kCGEventSourceUnixProcessID), CGEventGetIntegerValueField(eventRef, kCGEventTargetUnixProcessID), CGEventGetIntegerValueField(eventRef, kCGMouseEventWindowUnderMousePointer), location.x, location.y);
+	CFTypeRef role = NULL;
+	error = prepareElement(element) ? AXUIElementCopyAttributeValue(element, kAXRoleAttribute, &role) : kAXErrorCannotComplete;
+	CFTypeRef window = NULL;
+	if (error == kAXErrorSuccess && CFEqual(role, kAXWindowRole)) {
+		window = CFRetain(element);
+	} else {
+		if (error != kAXErrorSuccess) {
+			os_log_error(OS_LOG_DEFAULT, "%.0f clicked element role lookup failed pid=%d error=%d; using window attribute", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, error);
+		}
+		error = prepareElement(element) ? AXUIElementCopyAttributeValue(element, kAXWindowAttribute, &window) : kAXErrorCannotComplete;
+	}
+	if (role != NULL) {
+		CFRelease(role);
+	}
+	CFRelease(element);
+	if (error != kAXErrorSuccess) {
+		os_log_error(OS_LOG_DEFAULT, "%.0f clicked window lookup failed pid=%d error=%d", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, error);
+		CFRelease(target);
+		return;
+	}
+	CFTypeRef focusedWindow = NULL;
+	AXError focusError = prepareElement(target) ? AXUIElementCopyAttributeValue(target, kAXFocusedWindowAttribute, &focusedWindow) : kAXErrorCannotComplete;
+	if (focusError != kAXErrorSuccess) {
+		os_log_error(OS_LOG_DEFAULT, "%.0f focused window lookup failed pid=%d error=%d; raising clicked window", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, focusError);
+	}
+	BOOL windowIsFocused = focusError == kAXErrorSuccess && CFEqual(window, focusedWindow);
+	os_log(OS_LOG_DEFAULT, "%.0f click focus pid=%d active=%d focused=%d", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, application.active, windowIsFocused);
+	if (focusedWindow != NULL) {
+		CFRelease(focusedWindow);
+	}
+	if (!application.active && prepareElement(target)) {
+		error = AXUIElementSetAttributeValue(target, kAXFrontmostAttribute, kCFBooleanTrue);
+		os_log(OS_LOG_DEFAULT, "%.0f click activation pid=%d error=%d", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, error);
+	}
+	if ((!application.active || !windowIsFocused) && prepareElement(window)) {
+		error = AXUIElementPerformAction(window, kAXRaiseAction);
+		os_log(OS_LOG_DEFAULT, "%.0f clicked window raise pid=%d error=%d", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, error);
+	}
+	os_log(OS_LOG_DEFAULT, "%.0f click finish pid=%d active=%d duration_ms=%.1f", NSDate.date.timeIntervalSince1970 * 1000, processIdentifier, application.active, (CFAbsoluteTimeGetCurrent() - started) * 1000);
+	CFRelease(target);
+	CFRelease(window);
 }
 @end
 
@@ -198,6 +369,7 @@ CGPoint fixedPositionTo(CGPoint fixedPosition, Position position) {
 			//第四个参数, 要么CGEventMaskBit(CGEventType), 要么直接传NSEventMask
 			
 			_portRef = CGEventTapCreate(kCGSessionEventTap, kCGTailAppendEventTap, kCGEventTapOptionDefault, event, (CGEventTapCallBack)eventTapCallback, (__bridge void * _Nullable)(self));
+			os_log(OS_LOG_DEFAULT, "%.0f scroll tap created=%d target=%d trusted=%d", NSDate.date.timeIntervalSince1970 * 1000, _portRef != NULL, _targetApplication.processIdentifier, AXIsProcessTrusted());
 			if (_portRef == nil) {
 				return;
 			}
@@ -289,6 +461,9 @@ void _updateTargetApplicationBounds(AXObserverRef observer, AXUIElementRef eleme
 
 - (void)sendMouseEvent:(CGEventType)eventType atPosition:(CGPoint)position {
 	CGEventRef eventRef = CGEventCreateMouseEvent(NULL, eventType, fixedPositionTo(position, PositionTopLeft), 0);
+	if (eventType == kCGEventLeftMouseDown || eventType == kCGEventLeftMouseUp) {
+		os_log(OS_LOG_DEFAULT, "%.0f scroll mouse post type=%u x=%.1f y=%.1f source=%lld cursor=%d", NSDate.date.timeIntervalSince1970 * 1000, eventType, position.x, position.y, CGEventGetIntegerValueField(eventRef, kCGEventSourceUnixProcessID), self.showRealMouseCursor);
+	}
 	CGEventPost(kCGHIDEventTap, eventRef);
 	if (!self.showRealMouseCursor) {
 		CGWarpMouseCursorPosition(_beginScrollPosition);
@@ -296,7 +471,25 @@ void _updateTargetApplicationBounds(AXObserverRef observer, AXUIElementRef eleme
 }
 @end
 
+static CGEventRef clickActivationCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eventRef, void *context) {
+	AppDelegate *appDelegate = (__bridge AppDelegate *)context;
+	if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+		os_log_error(OS_LOG_DEFAULT, "%.0f click tap disabled reason=%u; enabling", NSDate.date.timeIntervalSince1970 * 1000, type);
+		CGEventTapEnable(appDelegate.clickActivationPort, true);
+		return eventRef;
+	}
+	if ((type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown || type == kCGEventOtherMouseDown) &&
+		(CGEventGetFlags(eventRef) & kCGEventFlagMaskCommand) == 0 &&
+		CGEventGetIntegerValueField(eventRef, kCGEventSourceUnixProcessID) != NSProcessInfo.processInfo.processIdentifier) {
+		[appDelegate activateApplicationBeforeMouseDown:eventRef];
+	}
+	return eventRef;
+}
+
 static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef eventRef, AppDelegate *appDelegate) {
+	if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+		os_log_error(OS_LOG_DEFAULT, "%.0f scroll tap disabled reason=%u", NSDate.date.timeIntervalSince1970 * 1000, type);
+	}
 	// topSimulatorWindowBounds is related to main screen, (0, 0) is left top corner of main, to top is decreasing
 
 	// event.locationInWindow is related to main screen, (0, 0) is left bottom corner of main, to top is increasing
@@ -328,6 +521,9 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 	
 	// 这里不能断点, 否则用NSEvent eventWithCGEvfent时内部的NSEvent会闪退
     NSEvent *event = [NSEvent eventWithCGEvent: eventRef];
+	if (event.phase != NSEventPhaseChanged) {
+		os_log(OS_LOG_DEFAULT, "%.0f scroll input phase=%lu target=%d x=%.1f y=%.1f bounds_x=%.1f bounds_y=%.1f bounds_w=%.1f bounds_h=%.1f dragging=%d", NSDate.date.timeIntervalSince1970 * 1000, (unsigned long)event.phase, appDelegate.targetApplication.processIdentifier, CGEventGetLocation(eventRef).x, CGEventGetLocation(eventRef).y, topSimulatorWindowBounds.origin.x, topSimulatorWindowBounds.origin.y, topSimulatorWindowBounds.size.width, topSimulatorWindowBounds.size.height, appDelegate.beginDragAction);
+	}
 //	NSLog(@"event: %@", event);
 	
 	CGEventType eventType;
